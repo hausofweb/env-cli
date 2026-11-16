@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: true
+  koffi: false
+
+minimumReleaseAge: 10080

@@ -1,0 +1,106 @@
+{
+  "name": "@hausofweb/env-cli",
+  "version": "0.0.0-development",
+  "description": "SOPS-encrypted env var management for Haus of Web monorepos",
+  "keywords": [
+    "cli",
+    "env",
+    "sops",
+    "ssm",
+    "vercel"
+  ],
+  "homepage": "https://github.com/hausofweb/env-cli#readme",
+  "bugs": {
+    "url": "https://github.com/hausofweb/env-cli/issues"
+  },
+  "license": "MIT",
+  "author": "Haus of Web",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hausofweb/env-cli.git"
+  },
+  "bin": {
+    "hwenv": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "prepare": "husky",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ssm": "^3.1161.0",
+    "@aws-sdk/client-sts": "^3.1161.0",
+    "@inquirer/prompts": "^8.7.5",
+    "@smithy/shared-ini-file-loader": "^4.7.2",
+    "@vercel/sdk": "^1.28.54",
+    "chalk": "^6.0.1",
+    "commander": "^15.0.0",
+    "fs-extra": "^11.4.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.4",
+    "@commitlint/config-conventional": "^21.2.4",
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^26.6.6",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.90.0",
+    "tsup": "^9.0.0",
+    "typescript": "^7.0.2",
+    "ultracite": "^8.1.1",
+    "vercel": "^65.9.0",
+    "vitest": "^5.0.5"
+  },
+  "peerDependencies": {
+    "vercel": "*"
+  },
+  "peerDependenciesMeta": {
+    "vercel": {
+      "optional": true
+    }
+  },
+  "commitlint": {
+    "extends": [
+      "@commitlint/config-conventional"
+    ],
+    "rules": {
+      "body-max-line-length": [
+        0
+      ],
+      "footer-max-line-length": [
+        0
+      ],
+      "header-max-length": [
+        0
+      ],
+      "subject-case": [
+        0
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.17.0+sha512.b8d223ebec04b580a89ed206daa71d1bccb6a1ee1d52efa95cc3b0db75271561df8f0d8e2c43add39c5ec08018af7a8a95108e7090f95a29f88727b7a40fd53d"
+}

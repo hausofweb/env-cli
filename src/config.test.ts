@@ -8,10 +8,12 @@ import {
   buildSsmPath,
   getAwsProfile,
   getEnvContext,
+  getSsmParameterNames,
   hasSsmConfig,
   isExternallyManagedKey,
   setEnvContext,
 } from "./config";
+import type { EnvConfig } from "./config";
 import { getEnvDir, getProjectRoot } from "./constants/paths";
 
 describe("env.config.json discovery", () => {
@@ -97,5 +99,79 @@ describe(buildSsmPath, () => {
     expect(buildSsmPath({ environment: "staging", key: "DATABASE_URL" })).toBe(
       "/staging/DATABASE_URL"
     );
+  });
+
+  it("nests the environment under a project prefix", () => {
+    expect(
+      buildSsmPath({
+        environment: "staging",
+        key: "DATABASE_URL",
+        prefix: "bpvs",
+      })
+    ).toBe("/bpvs/staging/DATABASE_URL");
+  });
+});
+
+const useSsm = (ssm: Partial<NonNullable<EnvConfig["ssm"]>>): void =>
+  setEnvContext({
+    config: {
+      envDir: "env",
+      externallyManagedKeys: [],
+      ssm: { optional: [], required: [], ...ssm },
+    },
+    root: "/repo",
+  });
+
+describe(getSsmParameterNames, () => {
+  afterEach(() => setEnvContext(undefined));
+
+  it("keeps the bare /<env>/<KEY> path for projects that set no prefix", () => {
+    useSsm({});
+
+    expect(
+      getSsmParameterNames({ environment: "production", key: "DATABASE_URL" })
+    ).toStrictEqual(["/production/DATABASE_URL"]);
+  });
+
+  it("ignores mirrorUnprefixedPaths without a prefix rather than writing the same path twice", () => {
+    useSsm({ mirrorUnprefixedPaths: true });
+
+    expect(
+      getSsmParameterNames({ environment: "production", key: "DATABASE_URL" })
+    ).toStrictEqual(["/production/DATABASE_URL"]);
+  });
+
+  it("puts the project path first and the legacy path second while mirroring", () => {
+    useSsm({ mirrorUnprefixedPaths: true, pathPrefix: "bpvs" });
+
+    expect(
+      getSsmParameterNames({ environment: "production", key: "DATABASE_URL" })
+    ).toStrictEqual([
+      "/bpvs/production/DATABASE_URL",
+      "/production/DATABASE_URL",
+    ]);
+  });
+});
+
+describe("ssm.pathPrefix validation", () => {
+  let repoRoot: string;
+
+  beforeEach(async () => {
+    repoRoot = await mkdtemp(path.join(tmpdir(), "env-cli-config-"));
+    setEnvContext(undefined);
+  });
+
+  afterEach(async () => {
+    setEnvContext(undefined);
+    await rm(repoRoot, { force: true, recursive: true });
+  });
+
+  it("rejects a prefix containing slashes, which would silently produce a different namespace", async () => {
+    await writeFile(
+      path.join(repoRoot, "env.config.json"),
+      JSON.stringify({ ssm: { pathPrefix: "/bpvs" } })
+    );
+
+    expect(() => getEnvContext(repoRoot)).toThrow(/pathPrefix/u);
   });
 });

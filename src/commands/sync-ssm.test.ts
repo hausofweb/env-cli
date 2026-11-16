@@ -7,6 +7,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setEnvContext } from "../config";
+import type { EnvConfig } from "../config";
 import { SSMService } from "../services/ssm.service";
 import type {
   DeleteSSMParameterInput,
@@ -35,13 +36,15 @@ const OPTIONAL_SSM_KEYS = [
   "CRON_SECRET",
 ];
 
-const useSsmConfig = (): void => {
+const useSsmConfig = (
+  ssm: Partial<NonNullable<EnvConfig["ssm"]>> = {}
+): void => {
   setEnvContext({
     config: {
       awsProfiles: { development: "dev" },
       envDir: "env",
       externallyManagedKeys: [],
-      ssm: { optional: OPTIONAL_SSM_KEYS, required: REQUIRED_SSM_KEYS },
+      ssm: { optional: OPTIONAL_SSM_KEYS, required: REQUIRED_SSM_KEYS, ...ssm },
     },
     root: "/repo",
   });
@@ -57,6 +60,11 @@ const LOCAL_VARIABLES = {
   STRIPE_WEBHOOK_RELAY_SECRET: "relay-secret",
   SUDO_EMAIL: "admin@example.com",
 };
+
+/** Optional keys with no infra-scoped typed value; NEXT_PUBLIC_APP_URL is in scope but untyped, so it warns rather than deletes. */
+const ABSENT_OPTIONAL_KEYS = OPTIONAL_SSM_KEYS.filter(
+  (key) => !(key in LOCAL_VARIABLES) && key !== "NEXT_PUBLIC_APP_URL"
+);
 
 // CALENDAR_WEBHOOK_RELAY_SECRET is an optional SSM key tagged for api only, so SSM must treat it
 // as absent. Its `# SecureString` sits right above an untyped infra-tagged
@@ -104,8 +112,57 @@ const silenceOutput = (): void => {
 /** Any command `SSMClient.send` accepts, captured by the stubbed `send` for assertions. */
 type SSMCommand = Parameters<typeof SSMClient.prototype.send>[0];
 
+/** Stubs AWS, sops and file access; records every SSM path put or deleted. */
+const stubSync = () => {
+  vi.spyOn(
+    syncSSMCommandDependencies,
+    "checkAndAuthenticateAWS"
+  ).mockResolvedValue(undefined);
+  vi.spyOn(
+    syncSSMCommandDependencies,
+    "clearAWSCredentialEnvVars"
+  ).mockReturnValue(undefined);
+  vi.spyOn(syncSSMCommandDependencies, "resetSSMClient").mockReturnValue(
+    undefined
+  );
+  vi.spyOn(syncSSMCommandDependencies, "validateSopsInstalled").mockReturnValue(
+    undefined
+  );
+
+  vi.spyOn(syncSSMCommandDependencies, "decrypt").mockImplementation(
+    (filePath: string) =>
+      Promise.resolve(
+        filePath.includes("shared") ? SHARED_CONTENT : INFRA_CONTENT
+      )
+  );
+  vi.spyOn(syncSSMCommandDependencies, "fileExists").mockResolvedValue(true);
+
+  silenceOutput();
+
+  const deleted: string[] = [];
+  const put: string[] = [];
+
+  const deleteParameter = vi
+    .spyOn(syncSSMCommandDependencies, "deleteParameter")
+    .mockImplementation(({ name }: DeleteSSMParameterInput) => {
+      deleted.push(name);
+
+      return Promise.resolve({ action: "deleted" as const, name });
+    });
+
+  const putParameter = vi
+    .spyOn(syncSSMCommandDependencies, "putParameter")
+    .mockImplementation(({ name, type }: PutSSMParameterInput) => {
+      put.push(name);
+
+      return Promise.resolve({ action: "created" as const, name, type });
+    });
+
+  return { deleteParameter, deleted, put, putParameter };
+};
+
 describe(handleSyncSSMCommand, () => {
-  beforeEach(useSsmConfig);
+  beforeEach(() => useSsmConfig());
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -138,50 +195,7 @@ describe(handleSyncSSMCommand, () => {
   });
 
   it("deletes absent optional parameters and syncs the present ones", async () => {
-    vi.spyOn(
-      syncSSMCommandDependencies,
-      "checkAndAuthenticateAWS"
-    ).mockResolvedValue(undefined);
-    vi.spyOn(
-      syncSSMCommandDependencies,
-      "clearAWSCredentialEnvVars"
-    ).mockReturnValue(undefined);
-    vi.spyOn(syncSSMCommandDependencies, "resetSSMClient").mockReturnValue(
-      undefined
-    );
-    vi.spyOn(
-      syncSSMCommandDependencies,
-      "validateSopsInstalled"
-    ).mockReturnValue(undefined);
-
-    vi.spyOn(syncSSMCommandDependencies, "decrypt").mockImplementation(
-      (filePath: string) =>
-        Promise.resolve(
-          filePath.includes("shared") ? SHARED_CONTENT : INFRA_CONTENT
-        )
-    );
-    vi.spyOn(syncSSMCommandDependencies, "fileExists").mockResolvedValue(true);
-
-    silenceOutput();
-
-    const deleted: string[] = [];
-    const put: string[] = [];
-
-    const deleteParameter = vi
-      .spyOn(syncSSMCommandDependencies, "deleteParameter")
-      .mockImplementation(({ name }: DeleteSSMParameterInput) => {
-        deleted.push(name);
-
-        return Promise.resolve({ action: "deleted" as const, name });
-      });
-
-    const putParameter = vi
-      .spyOn(syncSSMCommandDependencies, "putParameter")
-      .mockImplementation(({ name, type }: PutSSMParameterInput) => {
-        put.push(name);
-
-        return Promise.resolve({ action: "created" as const, name, type });
-      });
+    const { deleteParameter, deleted, put, putParameter } = stubSync();
 
     const failed = await handleSyncSSMCommand("development", {
       deleteAbsentOptional: true,
@@ -233,15 +247,59 @@ describe(handleSyncSSMCommand, () => {
     // survives the next optional key. The api-only CALENDAR_WEBHOOK_RELAY_SECRET counts as absent and is
     // deleted; NEXT_PUBLIC_APP_URL is in scope but untyped, which warns instead
     // (and the exact put list above already shows it wasn't synced).
-    const expectedDeletions = OPTIONAL_SSM_KEYS.filter(
-      (key) => !(key in LOCAL_VARIABLES) && key !== "NEXT_PUBLIC_APP_URL"
-    ).map((key) => `/development/${key}`);
+    const expectedDeletions = ABSENT_OPTIONAL_KEYS.map(
+      (key) => `/development/${key}`
+    );
 
     expect(new Set(deleted)).toStrictEqual(new Set(expectedDeletions));
     expect(deleteParameter.mock.calls[0]?.[0]).toMatchObject({ dryRun: false });
 
     // Nothing the sync just wrote may also have been deleted.
     expect(deleted.filter((name) => put.includes(name))).toStrictEqual([]);
+  });
+
+  it("writes under the project's pathPrefix so projects sharing an AWS account cannot overwrite each other", async () => {
+    useSsmConfig({ pathPrefix: "bpvs" });
+    const { deleted, put } = stubSync();
+
+    await expect(
+      handleSyncSSMCommand("development", { deleteAbsentOptional: true })
+    ).resolves.toBe(false);
+
+    expect(new Set(put)).toStrictEqual(
+      new Set(
+        Object.keys(LOCAL_VARIABLES).map((key) => `/bpvs/development/${key}`)
+      )
+    );
+    expect(new Set(deleted)).toStrictEqual(
+      new Set(ABSENT_OPTIONAL_KEYS.map((key) => `/bpvs/development/${key}`))
+    );
+  });
+
+  it("mirrors every write and delete to the unprefixed path so readers not yet migrated never see stale values", async () => {
+    useSsmConfig({ mirrorUnprefixedPaths: true, pathPrefix: "bpvs" });
+    const { deleted, put } = stubSync();
+
+    await expect(
+      handleSyncSSMCommand("development", { deleteAbsentOptional: true })
+    ).resolves.toBe(false);
+
+    expect(new Set(put)).toStrictEqual(
+      new Set(
+        Object.keys(LOCAL_VARIABLES).flatMap((key) => [
+          `/bpvs/development/${key}`,
+          `/development/${key}`,
+        ])
+      )
+    );
+    expect(new Set(deleted)).toStrictEqual(
+      new Set(
+        ABSENT_OPTIONAL_KEYS.flatMap((key) => [
+          `/bpvs/development/${key}`,
+          `/development/${key}`,
+        ])
+      )
+    );
   });
 });
 

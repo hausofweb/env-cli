@@ -3,9 +3,9 @@ import path from "node:path";
 import { Command } from "commander";
 
 import {
-  buildSsmPath,
   getAwsProfile,
   getSsmKeys,
+  getSsmParameterNames,
   hasSsmConfig,
 } from "../config";
 import { ENVIRONMENTS } from "../constants/environments";
@@ -208,7 +208,7 @@ const deleteMissingOptionalParameter = async ({
 }: {
   /** Report the deletion without calling SSM `DeleteParameter`. */
   dryRun: boolean;
-  /** Full `/<environment>/<key>` path from `buildSsmPath`. */
+  /** One full path from `getSsmParameterNames`. */
   parameterName: string;
   /** Tally updated with the outcome; a thrown delete counts as failed. */
   summary: SyncSummary;
@@ -246,7 +246,7 @@ interface OptionalParameterContext {
   deleteAbsentOptional: boolean;
   /** Log the deletions without calling SSM. */
   dryRun: boolean;
-  /** Environment whose `/${environment}/` SSM namespace is being synced. */
+  /** Environment whose SSM namespace is being synced. */
   environment: Environment;
   /** Variables merged from the decrypted env files for this environment. */
   mergedVariables: Record<string, string>;
@@ -288,21 +288,19 @@ const handleMissingOptionalParameter = async ({
     return;
   }
 
-  const parameterName = buildSsmPath({ environment, key });
+  const parameterNames = getSsmParameterNames({ environment, key });
 
   if (!deleteAbsentOptional) {
     output.warning(
-      `  Optional variable ${key} is absent from the infra-scoped env files; preserving existing remote value at ${parameterName}. Re-run with --delete-absent-optional to remove it from SSM.`
+      `  Optional variable ${key} is absent from the infra-scoped env files; preserving existing remote value at ${parameterNames.join(", ")}. Re-run with --delete-absent-optional to remove it from SSM.`
     );
 
     return;
   }
 
-  await deleteMissingOptionalParameter({
-    dryRun,
-    parameterName,
-    summary,
-  });
+  await mapSequentially(parameterNames, (parameterName) =>
+    deleteMissingOptionalParameter({ dryRun, parameterName, summary })
+  );
 };
 
 const logMissingOptionalParameters = async (
@@ -339,18 +337,15 @@ const getActionLabel = ({
 
 const syncParameter = async ({
   dryRun,
-  environment,
-  key,
+  parameterName,
   summary,
   type,
   value,
 }: {
   /** Report the create/update without calling SSM `PutParameter`. */
   dryRun: boolean;
-  /** SSM namespace the parameter is written under, `/<environment>/`. */
-  environment: Environment;
-  /** Known `ssm` config key; the parameter's last path segment. */
-  key: string;
+  /** One full path from `getSsmParameterNames`. */
+  parameterName: string;
   /** Tally updated with the outcome; a thrown put counts as failed. */
   summary: SyncSummary;
   /** SSM parameter type from the env file's annotation; `SecureString` is redacted in logs. */
@@ -358,8 +353,6 @@ const syncParameter = async ({
   /** Non-empty merged value from the decrypted env files. */
   value: string;
 }): Promise<void> => {
-  const parameterName = buildSsmPath({ environment, key });
-
   try {
     const result = await syncSSMCommandDependencies.putParameter({
       dryRun,
@@ -396,7 +389,7 @@ const syncAnnotatedParameter = async ({
 }: {
   /** Forwarded to `syncParameter`: preview the write without making it. */
   dryRun: boolean;
-  /** SSM namespace the parameter is written under, `/<environment>/`. */
+  /** Selects the SSM namespace the parameter is written under. */
   environment: Environment;
   /** Annotated env var; skipped with a warning unless it is in `ssm.required` or `ssm.optional`. */
   key: string;
@@ -424,14 +417,11 @@ const syncAnnotatedParameter = async ({
     return;
   }
 
-  await syncParameter({
-    dryRun,
-    environment,
-    key: parameterKey,
-    summary,
-    type,
-    value,
-  });
+  await mapSequentially(
+    getSsmParameterNames({ environment, key: parameterKey }),
+    (parameterName) =>
+      syncParameter({ dryRun, parameterName, summary, type, value })
+  );
 };
 
 const authenticateForEnvironment = async (
@@ -452,7 +442,7 @@ const syncEnvironment = async ({
   dryRun,
   environment,
 }: {
-  /** Picks the AWS profile, the env files, and the `/<environment>/` namespace. */
+  /** Picks the AWS profile, the env files, and the SSM namespace. */
   environment: Environment;
   /** Delete optional parameters absent locally instead of preserving them. */
   deleteAbsentOptional: boolean;

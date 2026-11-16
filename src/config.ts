@@ -7,6 +7,8 @@ import type { Environment } from "./types/app-config.types";
 
 export const ENV_CONFIG_FILENAME = "env.config.json";
 
+const SSM_PATH_SEGMENT = /^[\w.-]+$/u;
+
 const awsProfilesSchema = z.object({
   development: z.string().optional(),
   preview: z.string().optional(),
@@ -20,7 +22,14 @@ const envConfigSchema = z.object({
   externallyManagedKeys: z.array(z.string()).default([]),
   ssm: z
     .object({
+      /** Also write/delete `/<env>/<KEY>` alongside the prefixed path, while readers migrate. */
+      mirrorUnprefixedPaths: z.boolean().optional(),
       optional: z.array(z.string()).default([]),
+      /** Project namespace: parameters live at `/<pathPrefix>/<env>/<KEY>`. */
+      pathPrefix: z
+        .string()
+        .regex(SSM_PATH_SEGMENT, "must be a single path segment, no slashes")
+        .optional(),
       required: z.array(z.string()).default([]),
     })
     .optional(),
@@ -118,7 +127,28 @@ export const isExternallyManagedKey = (key: string): boolean =>
 export const buildSsmPath = ({
   environment,
   key,
+  prefix,
 }: {
   environment: string;
   key: string;
-}): string => `/${environment}/${key}`;
+  prefix?: string;
+}): string =>
+  prefix ? `/${prefix}/${environment}/${key}` : `/${environment}/${key}`;
+
+/** Every SSM path a key is written to and deleted from: the configured path first, then the unprefixed mirror if enabled. */
+export const getSsmParameterNames = ({
+  environment,
+  key,
+}: {
+  environment: string;
+  key: string;
+}): string[] => {
+  const { ssm } = getEnvContext().config;
+  const primary = buildSsmPath({ environment, key, prefix: ssm?.pathPrefix });
+
+  if (!(ssm?.pathPrefix && ssm.mirrorUnprefixedPaths)) {
+    return [primary];
+  }
+
+  return [primary, buildSsmPath({ environment, key })];
+};

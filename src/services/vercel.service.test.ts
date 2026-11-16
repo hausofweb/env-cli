@@ -1,16 +1,30 @@
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import type { Vercel } from "@vercel/sdk";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { fakeOf } from "../testing/fake";
 import { output } from "../utils/cli-output";
 import {
   buildSyncComment,
   extractSyncedHash,
+  getLocalVercelToken,
+  getVercelAuthPath,
   hashValue,
   needsTypeRecreate,
   SYNC_HASH_PREFIX,
   VercelService,
 } from "./vercel.service";
+
+vi.mock(import("node:child_process"), () => ({
+  execFileSync: vi.fn(() => {
+    throw new Error("tests must never run `vercel login`");
+  }),
+}));
 
 const STAGING_ID = "env_staging";
 
@@ -375,6 +389,123 @@ describe("syncEnvironmentVariables on a variable shared across environments", ()
       ["preview"],
       ["production"],
     ]);
+  });
+});
+
+describe("syncEnvironmentVariables change detection", () => {
+  // The comment hashes the raw value; comparing a trimmed one rewrote padded
+  // values on every sync.
+  it("skips a padded value it already synced", async () => {
+    const { projects, service } = statefulServiceWith([
+      rawEnv("PADDED", { comment: buildSyncComment(" x ") }),
+    ]);
+
+    const result = await service.syncEnvironmentVariables(
+      [{ key: "PADDED", value: " x " }],
+      "production"
+    );
+
+    expect(result.skippedKeys).toStrictEqual(["PADDED"]);
+    expect(projects.editProjectEnv).not.toHaveBeenCalled();
+  });
+
+  // Matching against a branch override would leave the general preview value stale.
+  it("compares and updates the general preview variable, never a per-branch override", async () => {
+    const { projects, service } = serviceWith([
+      rawEnv("KEY", { comment: buildSyncComment("old"), target: ["preview"] }),
+      {
+        ...rawEnv("KEY", {
+          comment: buildSyncComment("new"),
+          gitBranch: "feature-x",
+          target: ["preview"],
+        }),
+        id: "id-KEY-feature-x",
+      },
+    ]);
+
+    const result = await service.syncEnvironmentVariables(
+      [{ key: "KEY", value: "new" }],
+      "preview"
+    );
+
+    expect(result.updatedKeys).toStrictEqual(["KEY"]);
+    expect(projects.editProjectEnv).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: "id-KEY" })
+    );
+  });
+});
+
+describe(getVercelAuthPath, () => {
+  const home = "/home/u";
+
+  it.each([
+    ["darwin", {}, "/home/u/Library/Application Support"],
+    ["linux", {}, "/home/u/.local/share"],
+    ["linux", { XDG_DATA_HOME: "/data" }, "/data"],
+    [
+      "win32",
+      { APPDATA: "C:/Users/u/AppData/Roaming" },
+      "C:/Users/u/AppData/Roaming/xdg.data",
+    ],
+  ] as const)(
+    "finds the CLI's auth.json on %s with %o",
+    (platform, env, dataDir) => {
+      expect(getVercelAuthPath({ env, home, platform })).toBe(
+        path.join(dataDir, "com.vercel.cli", "auth.json")
+      );
+    }
+  );
+});
+
+describe(getLocalVercelToken, () => {
+  let dir = "";
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+
+    if (dir) {
+      await rm(dir, { force: true, recursive: true });
+    }
+  });
+
+  // A login that writes auth.json somewhere unexpected used to loop forever,
+  // blocking a CI runner.
+  it("runs `vercel login` at most once and then gives up", async () => {
+    const login = vi.fn<() => void>();
+
+    const token = await getLocalVercelToken({
+      authPath: "/nonexistent/com.vercel.cli/auth.json",
+      login,
+    });
+
+    expect(token).toBeNull();
+    expect(login).toHaveBeenCalledOnce();
+  });
+
+  it("reads the token the login just wrote", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "vercel-auth-"));
+    const authPath = path.join(dir, "auth.json");
+
+    const login = vi.fn(() => {
+      writeFileSync(
+        authPath,
+        JSON.stringify({ expiresAt: Date.now() / 1000 + 3600, token: "t" })
+      );
+    });
+
+    await expect(getLocalVercelToken({ authPath, login })).resolves.toBe("t");
+    expect(login).toHaveBeenCalledOnce();
+  });
+
+  // The error message tells users to set VERCEL_TOKEN, so it has to work.
+  it("uses VERCEL_TOKEN without looking for the CLI's auth file", async () => {
+    dir = await mkdtemp(path.join(tmpdir(), "vercel-auth-"));
+    vi.stubEnv("VERCEL_TOKEN", "env-token");
+    vi.stubEnv("XDG_DATA_HOME", dir);
+
+    await expect(VercelService.create()).resolves.toBeInstanceOf(VercelService);
+    expect(execFileSync).not.toHaveBeenCalled();
   });
 });
 

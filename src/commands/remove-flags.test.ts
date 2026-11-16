@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { setEnvContext } from "../config";
 import { removeByFlags } from "./remove";
 import type { RemoveByFlagsDependencies } from "./remove";
 import type { LoadedEnvironment } from "./update";
@@ -100,6 +101,71 @@ describe(removeByFlags, () => {
     });
 
     expect(removeFromVercel).toHaveBeenCalledExactlyOnceWith({
+      dryRun: false,
+      environments: ["staging"],
+      key: KEY,
+    });
+  });
+
+  // Apps that only saw the shared/ copy would keep reading it remotely, since
+  // `env sync` never deletes; web still has its own copy and keeps it.
+  it("deletes the remote copies of apps that lost the key with --target shared, and only with --push", async () => {
+    const web = { name: "web", type: "vercel" } as const;
+    const api = { name: "api", type: "vercel" } as const;
+    const infra = { name: "infra", type: "non-vercel" } as const;
+
+    setEnvContext({
+      config: {
+        envDir: "env",
+        externallyManagedKeys: [],
+        ssm: { optional: [KEY], required: [] },
+      },
+      root: "/repo",
+    });
+
+    const loaded: LoadedEnvironment = {
+      audience: new Set(["api", "infra", "web"]),
+      environment: "staging",
+      files: new Map([
+        [
+          "shared",
+          {
+            ...file("shared"),
+            content: `# @apps: api, infra, web\n# String\n${KEY}="x"\n`,
+          },
+        ],
+        ["web", { ...file("web"), content: `${KEY}="x"\n` }],
+      ]),
+    };
+
+    define(loaded);
+    const withApps = {
+      ...dependencies,
+      getAllApps: () => Promise.resolve([api, infra, web]),
+    };
+
+    await removeByFlags({
+      dependencies: withApps,
+      flags: { env: ["staging"], target: "shared" },
+      key: KEY,
+    });
+
+    expect(removeFromVercel).not.toHaveBeenCalled();
+    expect(removeFromSSM).not.toHaveBeenCalled();
+
+    await removeByFlags({
+      dependencies: withApps,
+      flags: { env: ["staging"], push: true, target: "shared" },
+      key: KEY,
+    });
+
+    expect(removeFromVercel).toHaveBeenCalledExactlyOnceWith({
+      apps: [api],
+      dryRun: false,
+      environments: ["staging"],
+      key: KEY,
+    });
+    expect(removeFromSSM).toHaveBeenCalledExactlyOnceWith({
       dryRun: false,
       environments: ["staging"],
       key: KEY,

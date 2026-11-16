@@ -62,7 +62,7 @@ interface SyncResult {
 interface AppResult {
   /** Variables created in Vercel (or that would be, in dry-run). */
   added: number;
-  /** Variables the Vercel API rejected, plus a prune skipped on a failed decrypt. */
+  /** Variables the Vercel API rejected, or 1 when the app's file failed to decrypt. */
   failed: number;
   /** Stale variables taken out of the environment by `--confirm-prune`. */
   pruned: number;
@@ -117,7 +117,7 @@ const validateEnvironmentAndSetup = async (
 
 /**
  * Returns "" when the file doesn't exist and null when it exists but couldn't
- * be decrypted, so a prune never mistakes a failed read for an empty file.
+ * be decrypted, so a failed read is never synced or pruned as an empty file.
  */
 const decryptEnvFile = async (
   directory: string,
@@ -336,8 +336,8 @@ const processApp = async ({
   environment: Environment;
   /** Dry-run and prune settings for the whole run. */
   options: SyncOptions;
-  /** Decrypted shared env file; null when it failed to decrypt. */
-  sharedContent: string | null;
+  /** Decrypted shared env file. */
+  sharedContent: string;
 }): Promise<AppResult> => {
   output.info(`\nProcessing ${app.name}...`);
 
@@ -353,6 +353,14 @@ const processApp = async ({
 
   const appContent = await decryptEnvFile(app.name, environment);
 
+  if (appContent === null) {
+    output.error(
+      `  Skipped: ${app.name}'s ${environment} file failed to decrypt`
+    );
+
+    return { ...EMPTY_APP_RESULT, failed: 1 };
+  }
+
   // An app from another repository only runs where it has its own file
   // (for example staging and production only); shared variables alone mustn't
   // populate its other Vercel environments.
@@ -363,9 +371,9 @@ const processApp = async ({
   }
 
   const typedVars = buildAppVariables({
-    appContent: appContent ?? "",
+    appContent,
     appName: app.name,
-    sharedContent: sharedContent ?? "",
+    sharedContent,
   });
 
   if (typedVars.length === 0) {
@@ -397,14 +405,6 @@ const processApp = async ({
 
   if (options.prune === "off") {
     return appResult;
-  }
-
-  if (sharedContent === null || appContent === null) {
-    output.error(
-      "  Prune skipped: an encrypted file failed to decrypt, so the expected set is incomplete"
-    );
-
-    return { ...appResult, failed: appResult.failed + 1 };
   }
 
   appResult.pruned = await pruneAppEnvironment({
@@ -468,8 +468,8 @@ const executeSyncForAllApps = async ({
   environment: Environment;
   /** Dry-run and prune settings for the whole run. */
   options: SyncOptions;
-  /** Decrypted shared env file; null when it failed to decrypt. */
-  sharedContent: string | null;
+  /** Decrypted shared env file. */
+  sharedContent: string;
 }): Promise<SyncResult> => {
   const syncResult: SyncResult = {
     errorCount: 0,
@@ -577,6 +577,15 @@ export const handleSyncCommand = async (
 
       output.info("\nDecrypting shared environment...");
       const sharedContent = await decryptEnvFile("shared", environment);
+
+      // Every app would be pushed without its shared variables.
+      if (sharedContent === null) {
+        output.error(
+          `Skipped ${environment}: the shared file failed to decrypt`
+        );
+
+        return true;
+      }
 
       const syncResult = await executeSyncForAllApps({
         apps,

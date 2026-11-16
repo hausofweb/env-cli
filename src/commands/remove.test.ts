@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
+import { setEnvContext } from "../config";
 import { EnvFilterService } from "../services/env-filter.service";
 import type { AppConfig } from "../types/app-config.types";
-import { planRemoval, removeVariableLines } from "./remove";
+import { planRemoteRemovals, planRemoval, removeVariableLines } from "./remove";
 import { variableAudience } from "./update";
 import type { LoadedEnvironment } from "./update";
 
@@ -73,8 +74,9 @@ describe(planRemoval, () => {
     expect(changes.shared).not.toContain("NEXT_PUBLIC_TURNSTILE_SITE_KEY");
   });
 
-  // Remote Vercel/SSM cleanup is only valid once nobody reads the variable.
-  it("does not mark a still-read variable as retired", async () => {
+  // Retiring clears every remote copy; a still-read variable only loses the
+  // dropped apps' copies.
+  it("does not mark a still-read variable as retired, and names the apps that lost it", async () => {
     const plan = await planRemoval({
       allApps,
       key: "NEXT_PUBLIC_TURNSTILE_SITE_KEY",
@@ -85,6 +87,7 @@ describe(planRemoval, () => {
     });
 
     expect(plan?.isRetired).toBe(false);
+    expect(plan?.dropped).toStrictEqual(["infra"]);
   });
 
   it("skips an environment where none of the removed apps saw the variable", async () => {
@@ -96,6 +99,70 @@ describe(planRemoval, () => {
     });
 
     expect(plan).toBeNull();
+  });
+});
+
+describe(planRemoteRemovals, () => {
+  const infra: AppConfig = { name: "infra", type: "non-vercel" };
+  const apps = [app("app"), app("web"), infra];
+
+  beforeEach(() => {
+    setEnvContext({
+      config: {
+        envDir: "env",
+        externallyManagedKeys: [],
+        ssm: { optional: ["CRON_SECRET"], required: [] },
+      },
+      root: "/repo",
+    });
+  });
+
+  // `env sync` never deletes, so a dropped app keeps reading its old copy
+  // unless the removal deletes it.
+  it("deletes only the dropped apps' copies when the key is narrowed, keeping the remaining apps'", () => {
+    const removals = planRemoteRemovals({
+      allApps: apps,
+      key: "CRON_SECRET",
+      outcomes: [
+        { dropped: ["web", "infra"], environment: "staging", isRetired: false },
+      ],
+    });
+
+    expect(removals).toStrictEqual({
+      ssmEnvironments: ["staging"],
+      vercel: [{ apps: [app("web")], environments: ["staging"] }],
+    });
+  });
+
+  it("clears every Vercel app and SSM where the key is retired", () => {
+    const removals = planRemoteRemovals({
+      allApps: apps,
+      key: "CRON_SECRET",
+      outcomes: [
+        { dropped: ["app"], environment: "production", isRetired: true },
+        { dropped: ["app"], environment: "staging", isRetired: false },
+      ],
+    });
+
+    expect(removals).toStrictEqual({
+      ssmEnvironments: ["production"],
+      vercel: [
+        { environments: ["production"] },
+        { apps: [app("app")], environments: ["staging"] },
+      ],
+    });
+  });
+
+  it("never touches SSM for a key the SSM sync does not know", () => {
+    const removals = planRemoteRemovals({
+      allApps: apps,
+      key: "NEXT_PUBLIC_TURNSTILE_SITE_KEY",
+      outcomes: [
+        { dropped: ["infra"], environment: "staging", isRetired: false },
+      ],
+    });
+
+    expect(removals).toStrictEqual({ ssmEnvironments: [], vercel: [] });
   });
 });
 

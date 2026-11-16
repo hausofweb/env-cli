@@ -113,26 +113,26 @@ const getAppsToSetup = async (appArg?: string): Promise<AppConfigs> => {
 const decryptEnvironment = async (
   envPath: string,
   label: string
-): Promise<string> => {
+): Promise<{ content: string; wasDecrypted: boolean }> => {
   if (!(await FileOperations.fileExists(envPath))) {
-    return "";
+    return { content: "", wasDecrypted: false };
   }
 
   try {
     const content = await SopsService.decrypt(envPath);
     output.success(`  Decrypted ${label}`);
 
-    return content;
+    return { content, wasDecrypted: true };
   } catch (error) {
     output.warning(
       `  Failed to decrypt ${label}\n${error instanceof Error ? error.message : "Unknown error"}`
     );
 
-    return "";
+    return { content: "", wasDecrypted: false };
   }
 };
 
-const setupApp = async (
+export const setupApp = async (
   appName: string,
   environment: Environment
 ): Promise<void> => {
@@ -150,19 +150,20 @@ const setupApp = async (
   const appEnvPath = path.join(appEnvDir, `${getEnvFileName(environment)}.enc`);
 
   // One sops run at a time: concurrent decrypts flood KMS and interleave output.
-  const [sharedContent, appContent] = await mapSequentially(
-    [
-      { envPath: sharedEnvPath, label: "shared environment" },
-      { envPath: appEnvPath, label: "app environment" },
-    ],
-    ({ envPath, label }) => decryptEnvironment(envPath, label)
-  );
+  const [{ content: sharedContent }, { content: appContent, wasDecrypted }] =
+    await mapSequentially(
+      [
+        { envPath: sharedEnvPath, label: "shared environment" },
+        { envPath: appEnvPath, label: "app environment" },
+      ],
+      ({ envPath, label }) => decryptEnvironment(envPath, label)
+    );
 
   // Write decrypted app-specific content directly to env/{app}/ directory
   const envFileName = getEnvFileName(environment);
   const envFilePath = path.join(appEnvDir, envFileName);
 
-  if (appContent.trim() || appContent === "") {
+  if (wasDecrypted) {
     await FileOperations.writeFile(envFilePath, appContent);
 
     const appVarCount = EnvFilterService.filterForApp(
@@ -174,7 +175,9 @@ const setupApp = async (
       `  Wrote ${envFileName} to env/${app.name}/ (${appVarCount} variables)`
     );
   } else {
-    output.info(`  No app-specific variables for ${environment}`);
+    output.warning(
+      `  Skipped writing ${envFileName} (decryption failed or file missing)`
+    );
   }
 
   if (!app.directory) {

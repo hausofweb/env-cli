@@ -215,9 +215,10 @@ export const decryptEnvironment = async (
     );
   }
 
+  // A failed shared decrypt would leave every .env.local without its shared variables.
   // sequential so per-app console output stays readable and ordered
   const results = await mapSequentially(apps, (app) =>
-    processApp(app, environment, sharedContent, shouldCopy)
+    processApp(app, environment, sharedContent, shouldCopy && !sharedFailed)
   );
 
   const successCount = results.filter((result) => result.success).length;

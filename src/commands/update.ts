@@ -795,9 +795,15 @@ const defaultUpdateByFlagsDependencies: UpdateByFlagsDependencies = {
   updateApps,
 };
 
+const parseList = (raw: string | undefined): string[] =>
+  (raw ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
 const assertFlagsFitMode = (flags: UpdateFlags): void => {
   if (flags.apps) {
-    if (!flags.to) {
+    if (parseList(flags.to).length === 0) {
       throw new Error("--apps needs --to <apps> with a KEY");
     }
 
@@ -836,12 +842,6 @@ const assertOneCopyPerEnvironment = ({
     }
   }
 };
-
-const parseList = (raw: string | undefined): string[] =>
-  (raw ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
 
 const applyFlagUpdate = async ({
   dependencies,

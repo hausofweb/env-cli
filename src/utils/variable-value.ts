@@ -9,21 +9,24 @@ const NEWLINE_PATTERN = /[\r\n]/u;
 export const escapeEnvValue = (value: string): string =>
   value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 
+/** True, or why the value can't be written: env files are read line by line, so a newline would split it. */
+export const validateVariableValue = (raw: string): string | true => {
+  if (raw.length === 0) {
+    return "Value cannot be empty";
+  }
+
+  if (NEWLINE_PATTERN.test(raw)) {
+    return "Value cannot contain newline characters";
+  }
+
+  return true;
+};
+
 export const promptValue = (key: string, label: string): Promise<string> =>
   password({
     mask: "*",
     message: `Value for ${key} (${label}):`,
-    validate: (raw) => {
-      if (raw.length === 0) {
-        return "Value cannot be empty";
-      }
-
-      if (NEWLINE_PATTERN.test(raw)) {
-        return "Value cannot contain newline characters";
-      }
-
-      return true;
-    },
+    validate: validateVariableValue,
   });
 
 export const promptValuesPerEnvironment = async (

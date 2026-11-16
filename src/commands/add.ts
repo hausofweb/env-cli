@@ -21,11 +21,13 @@ import { outputAWSCredentialsError } from "../utils/aws-credentials-guidance";
 import { output } from "../utils/cli-output";
 import { getEnvFileName } from "../utils/env-parser";
 import { FileOperations } from "../utils/file-operations";
+import { assertProductionConfirmed } from "../utils/non-interactive";
 import { isExitPromptError } from "../utils/prompt-errors";
 import { SHARED_DIR_NAME } from "../utils/variable-locations";
 import {
   escapeEnvValue,
   promptValuesPerEnvironment,
+  validateVariableValue,
 } from "../utils/variable-value";
 import { decryptEnvironment as defaultDecryptEnvironment } from "./decrypt";
 import {
@@ -121,6 +123,8 @@ const promptForAnswers = async (): Promise<AddVariableAnswers> => {
 export interface AddFlags {
   /** Comma-separated app folder names, e.g. `app,web`. */
   apps?: string;
+  /** Required for production, which is otherwise only reachable through the prompts. */
+  confirmProduction?: boolean;
   /** Comma-separated environments, e.g. `development,staging`. */
   env?: string;
   /** Run `env sync` / `env sync-ssm` for real after writing; skipped otherwise. */
@@ -176,9 +180,10 @@ export const resolveFlagValue = async ({
 
   // `jq -r` and `echo` end the value with a newline that isn't part of it.
   const value = flags.value ?? stripTrailingNewline(await readValue());
+  const validation = validateVariableValue(value);
 
-  if (!value) {
-    throw new Error("The value is empty");
+  if (validation !== true) {
+    throw new Error(validation);
   }
 
   return value;
@@ -211,6 +216,11 @@ export const answersFromFlags = ({
     }
 
     return environment;
+  });
+
+  assertProductionConfirmed({
+    environments,
+    isConfirmed: flags.confirmProduction,
   });
 
   const apps = splitList(flags.apps, "--apps").map((name) => {
@@ -602,6 +612,7 @@ export const addCommand = new Command("add")
   .option("--value <value>", "the value inline (non-secrets only)")
   .option("--value-stdin", "read the value from stdin")
   .option("--push", "run env sync / env sync-ssm after writing")
+  .option("--confirm-production", "allow writing production without a prompt")
   .action(async (key: string | undefined, flags: AddFlags) => {
     try {
       const allApps = await AppDiscoveryService.getAllApps();

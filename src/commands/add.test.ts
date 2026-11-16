@@ -219,6 +219,20 @@ describe(resolveFlagValue, () => {
       })
     ).rejects.toThrow("empty");
   });
+
+  // The env files are read line by line: a second line would become its own
+  // variable and be synced to Vercel and SSM.
+  it("refuses a value with a line break, from stdin or inline", async () => {
+    await expect(
+      resolveFlagValue({
+        flags: { valueStdin: true },
+        readValue: () => Promise.resolve("abc\nOTHER=evil\n"),
+      })
+    ).rejects.toThrow("newline");
+    await expect(
+      resolveFlagValue({ flags: { value: "abc\rdef" } })
+    ).rejects.toThrow("newline");
+  });
 });
 
 describe(answersFromFlags, () => {
@@ -267,6 +281,24 @@ describe(answersFromFlags, () => {
     expect(() =>
       answersFromFlags({ allApps, flags, key: "SOME_KEY", value: "v" })
     ).toThrow(message);
+  });
+
+  // A second `add` of an existing key wins over the first, so without a prompt
+  // a wrong --env would silently replace the production value.
+  it("refuses production without --confirm-production, and accepts it with the flag", () => {
+    const flags = { apps: "web", env: "staging,production" };
+
+    expect(() =>
+      answersFromFlags({ allApps, flags, key: "SOME_KEY", value: "v" })
+    ).toThrow("--confirm-production");
+    expect(
+      answersFromFlags({
+        allApps,
+        flags: { ...flags, confirmProduction: true },
+        key: "SOME_KEY",
+        value: "v",
+      }).environments
+    ).toStrictEqual(["staging", "production"]);
   });
 
   it("refuses a key the wizard would refuse", () => {

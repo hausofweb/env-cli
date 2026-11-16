@@ -8,6 +8,8 @@ import type { GetCallerIdentityCommandOutput } from "@aws-sdk/client-sts";
 import { loadSharedConfigFiles as defaultLoadSharedConfigFiles } from "@smithy/shared-ini-file-loader";
 import chalk from "chalk";
 
+import { getEnvContext } from "../config";
+
 /** Why credential resolution failed; lets the CLI print a targeted remedy. */
 type AWSCredentialsErrorCode =
   | "AWS_CREDENTIALS_ERROR"
@@ -31,7 +33,8 @@ export class AWSCredentialsError extends Error {
 }
 
 /** Profile assumed when a blocked production profile is dropped or none is set. */
-const DEFAULT_AWS_PROFILE = "dev";
+const getDefaultAwsProfile = (): string =>
+  getEnvContext().config.awsProfiles?.development ?? "dev";
 
 const CI_ENVIRONMENT_VARIABLES = [
   "CI",
@@ -168,12 +171,13 @@ export const createAwsCredentials = ({
       !options?.allowProduction &&
       isBlockedProdProfile(process.env.AWS_PROFILE ?? null)
     ) {
+      const fallbackProfile = getDefaultAwsProfile();
       console.log(
         chalk.yellow(
-          `⚠️  Ignoring blocked production profile "${process.env.AWS_PROFILE}" — falling back to ${DEFAULT_AWS_PROFILE}.\n`
+          `⚠️  Ignoring blocked production profile "${process.env.AWS_PROFILE}" — falling back to ${fallbackProfile}.\n`
         )
       );
-      process.env.AWS_PROFILE = DEFAULT_AWS_PROFILE;
+      process.env.AWS_PROFILE = fallbackProfile;
     }
 
     // A sourced `assume` leaves session keys in the shell beside AWS_PROFILE, and they
@@ -192,7 +196,7 @@ export const createAwsCredentials = ({
       return;
     }
 
-    const profile = process.env.AWS_PROFILE ?? DEFAULT_AWS_PROFILE;
+    const profile = process.env.AWS_PROFILE ?? getDefaultAwsProfile();
 
     throw new AWSCredentialsError(
       `Run \`aws sso login --profile ${profile}\` to authenticate, then retry.`,

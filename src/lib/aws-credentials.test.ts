@@ -4,6 +4,7 @@ import type { GetCallerIdentityCommandOutput } from "@aws-sdk/client-sts";
 import type { loadSharedConfigFiles } from "@smithy/shared-ini-file-loader";
 import { beforeEach, describe, expect, it, vi, afterEach } from "vitest";
 
+import { setEnvContext } from "../config";
 import { AWSCredentialsError, createAwsCredentials } from "./aws-credentials";
 
 const sendMock =
@@ -155,6 +156,26 @@ describe("aws-credentials credential_process migration", () => {
       code: "AUTH_REQUIRED",
       message: expect.stringContaining("aws sso login --profile dev"),
     });
+  });
+
+  // A repo whose development profile isn't called "dev" would otherwise fall
+  // back to a profile that doesn't exist.
+  it("falls back to the development profile named in env.config.json", async () => {
+    setEnvContext({
+      config: {
+        awsProfiles: { development: "acme-dev" },
+        envDir: "env",
+        externallyManagedKeys: [],
+      },
+      root: "/repo",
+    });
+    process.env.AWS_PROFILE = "prod";
+    sendMock.mockRejectedValue(new Error("missing credentials"));
+
+    await expect(checkAndAuthenticateAWS()).rejects.toMatchObject({
+      message: expect.stringContaining("aws sso login --profile acme-dev"),
+    });
+    expect(process.env.AWS_PROFILE).toBe("acme-dev");
   });
 
   // Login is an explicit `aws sso login` step; a subprocess import here would

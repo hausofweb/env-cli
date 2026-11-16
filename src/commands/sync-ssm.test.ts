@@ -109,6 +109,7 @@ describe(handleSyncSSMCommand, () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     setEnvContext(undefined);
   });
 
@@ -127,6 +128,45 @@ describe(handleSyncSSMCommand, () => {
     await expect(handleSyncSSMCommand("all", {})).resolves.toBe(false);
     expect(validateSopsInstalled).not.toHaveBeenCalled();
     expect(putParameter).not.toHaveBeenCalled();
+  });
+
+  // `add` and `update` keep running after the sync, so a leaked production
+  // profile (or the credentials cleared for it) would follow them.
+  it("runs under the environment's profile, then restores the caller's AWS variables even when the sync fails", async () => {
+    vi.stubEnv("AWS_PROFILE", "caller");
+    vi.stubEnv("AWS_ACCESS_KEY_ID", "CALLER_KEY");
+    vi.stubEnv("AWS_REGION", undefined);
+
+    const profilesSeen: (string | undefined)[] = [];
+
+    vi.spyOn(
+      syncSSMCommandDependencies,
+      "checkAndAuthenticateAWS"
+    ).mockImplementation(() => {
+      profilesSeen.push(process.env.AWS_PROFILE);
+      process.env.AWS_REGION = "us-east-1";
+
+      return Promise.resolve();
+    });
+    vi.spyOn(syncSSMCommandDependencies, "resetSSMClient").mockReturnValue(
+      undefined
+    );
+    vi.spyOn(
+      syncSSMCommandDependencies,
+      "validateSopsInstalled"
+    ).mockReturnValue(undefined);
+    vi.spyOn(syncSSMCommandDependencies, "fileExists").mockResolvedValue(true);
+    vi.spyOn(syncSSMCommandDependencies, "decrypt").mockRejectedValue(
+      new Error("AccessDeniedException")
+    );
+    silenceOutput();
+
+    await expect(handleSyncSSMCommand("development", {})).resolves.toBe(true);
+
+    expect(profilesSeen).toStrictEqual(["dev"]);
+    expect(process.env.AWS_PROFILE).toBe("caller");
+    expect(process.env.AWS_ACCESS_KEY_ID).toBe("CALLER_KEY");
+    expect(process.env.AWS_REGION).toBeUndefined();
   });
 
   it("exposes --delete-absent-optional on the CLI", () => {

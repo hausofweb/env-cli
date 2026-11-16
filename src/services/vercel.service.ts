@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import { Vercel } from "@vercel/sdk";
@@ -308,23 +309,6 @@ const processEnvArray = (
   return envVars;
 };
 
-/**
- * Normalize value for comparison by trimming and handling quotes
- */
-const normalizeValueForComparison = (value: string): string => {
-  let normalized = value.trim();
-
-  // Remove surrounding quotes if present
-  if (
-    (normalized.startsWith('"') && normalized.endsWith('"')) ||
-    (normalized.startsWith("'") && normalized.endsWith("'"))
-  ) {
-    normalized = normalized.slice(1, -1);
-  }
-
-  return normalized;
-};
-
 const logDebugUpdateReason = ({
   currentHash,
   currentVercelType,
@@ -360,6 +344,105 @@ const logDebugUpdateReason = ({
   console.log(`[DEBUG] ${key}: ${reason}, will update`);
 };
 
+/** The data directory the Vercel CLI (through xdg-portable) keeps `com.vercel.cli/` in. */
+const getVercelDataDir = ({
+  env,
+  home,
+  platform,
+}: {
+  env: NodeJS.ProcessEnv;
+  home: string;
+  platform: NodeJS.Platform;
+}): string => {
+  if (env.XDG_DATA_HOME) {
+    return env.XDG_DATA_HOME;
+  }
+
+  if (platform === "darwin") {
+    return path.join(home, "Library", "Application Support");
+  }
+
+  if (platform === "win32") {
+    return path.join(
+      env.APPDATA || path.join(home, "AppData", "Roaming"),
+      "xdg.data"
+    );
+  }
+
+  return path.join(home, ".local", "share");
+};
+
+export const getVercelAuthPath = ({
+  env = process.env,
+  home = homedir(),
+  platform = process.platform,
+}: {
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+  platform?: NodeJS.Platform;
+} = {}): string =>
+  path.join(
+    getVercelDataDir({ env, home, platform }),
+    "com.vercel.cli",
+    "auth.json"
+  );
+
+const vercelAuthSchema = z.object({
+  expiresAt: z.number(),
+  refreshToken: z.string().optional(),
+  token: z.string(),
+});
+
+const loginViaVercelCLI = (): void => {
+  process.stdout.write("Authenticating via Vercel CLI...\n");
+  execFileSync(process.execPath, [resolvePackageBin("vercel"), "login"], {
+    stdio: "inherit",
+  });
+};
+
+/**
+ * The Vercel CLI's own token. A missing or expired one runs `vercel login`
+ * once; if that still leaves none, the caller reports it instead of looping.
+ */
+export const getLocalVercelToken = async ({
+  authPath = getVercelAuthPath(),
+  hasAttemptedLogin = false,
+  login = loginViaVercelCLI,
+}: {
+  authPath?: string;
+  hasAttemptedLogin?: boolean;
+  login?: () => void;
+} = {}): Promise<string | null> => {
+  const retryAfterLogin = (): Promise<string | null> | null => {
+    if (hasAttemptedLogin) {
+      return null;
+    }
+
+    login();
+
+    return getLocalVercelToken({ authPath, hasAttemptedLogin: true, login });
+  };
+
+  if (!(await FileOperations.fileExists(authPath))) {
+    return retryAfterLogin();
+  }
+
+  try {
+    const content = await FileOperations.readFile(authPath);
+    const parsed = vercelAuthSchema.parse(JSON.parse(content));
+
+    if (parsed.expiresAt * 1000 < Date.now()) {
+      return await retryAfterLogin();
+    }
+
+    return parsed.token || null;
+  } catch (error) {
+    console.warn(`Failed to read Vercel auth token: ${error}`);
+
+    return null;
+  }
+};
+
 export class VercelService {
   private readonly vercel: Vercel;
   private projectId?: string;
@@ -374,7 +457,8 @@ export class VercelService {
    * Factory method to create and initialize a VercelService instance
    */
   static async create(token?: string): Promise<VercelService> {
-    const vercelToken = token || (await VercelService.getLocalVercelToken());
+    const vercelToken =
+      token || process.env.VERCEL_TOKEN || (await getLocalVercelToken());
 
     if (!vercelToken) {
       throw new VercelError(
@@ -388,59 +472,6 @@ export class VercelService {
     });
 
     return new VercelService(vercel);
-  }
-
-  /**
-   * Get local Vercel token from CLI auth file
-   */
-  private static async getLocalVercelToken(): Promise<string | null> {
-    const configSchema = z.object({
-      expiresAt: z.number(),
-      refreshToken: z.string().optional(),
-      token: z.string(),
-    });
-
-    const vercelAuthPath = path.join(
-      process.env.HOME || "",
-      "Library",
-      "Application Support",
-      "com.vercel.cli",
-      "auth.json"
-    );
-
-    if (!(await FileOperations.fileExists(vercelAuthPath))) {
-      VercelService.authViaVercelCLI();
-
-      return VercelService.getLocalVercelToken();
-    }
-
-    try {
-      const content = await FileOperations.readFile(vercelAuthPath);
-      const authData = JSON.parse(content);
-      const parsed = configSchema.parse(authData);
-
-      if (parsed.expiresAt * 1000 < Date.now()) {
-        VercelService.authViaVercelCLI();
-
-        return VercelService.getLocalVercelToken();
-      }
-
-      return parsed.token || null;
-    } catch (error) {
-      console.warn(`Failed to read Vercel auth token: ${error}`);
-
-      return null;
-    }
-  }
-
-  /**
-   * Authenticate via Vercel CLI
-   */
-  private static authViaVercelCLI(): void {
-    process.stdout.write("Authenticating via Vercel CLI...\n");
-    execFileSync(process.execPath, [resolvePackageBin("vercel"), "login"], {
-      stdio: "inherit",
-    });
   }
 
   /**
@@ -832,7 +863,6 @@ export class VercelService {
     environment: Environment,
     dryRun: boolean
   ): Promise<{ action: "added" | "updated" | "skipped"; error?: string }> {
-    const normalizedNewValue = normalizeValueForComparison(variable.value);
     const resolvedType = resolveVercelType(variable.type, environment);
     const currentVar = currentMap.get(variable.key);
 
@@ -840,7 +870,6 @@ export class VercelService {
       return this.handleExistingVariable(
         variable,
         currentVar,
-        normalizedNewValue,
         resolvedType,
         environment,
         dryRun
@@ -987,13 +1016,13 @@ export class VercelService {
   private async handleExistingVariable(
     variable: EnvVariable,
     currentVar: VercelExistingVariable,
-    normalizedNewValue: string,
     resolvedType: VercelVariableType,
     environment: Environment,
     dryRun: boolean
   ): Promise<{ action: "updated" | "skipped"; error?: string }> {
     const currentHash = extractSyncedHash(currentVar.comment);
-    const newHash = hashValue(normalizedNewValue);
+    // Same input as buildSyncComment, or a value it hashes differently never matches.
+    const newHash = hashValue(variable.value);
 
     const typeChanged =
       currentVar.vercelType !== undefined &&
@@ -1056,7 +1085,12 @@ export class VercelService {
 
     // Get current state (keys and IDs only)
     const currentVars = await this.getEnvironmentVariables(environment);
-    const currentMap = new Map(currentVars.map((v) => [v.key, v]));
+
+    // A per-branch preview override is set on purpose outside the files; the
+    // sync compares and updates the general variable only.
+    const currentMap = new Map(
+      currentVars.filter((v) => !v.gitBranch).map((v) => [v.key, v])
+    );
 
     if (process.env.DEBUG === "true") {
       console.log(

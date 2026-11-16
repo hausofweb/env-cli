@@ -25,10 +25,12 @@ import {
 import { isExitPromptError } from "../utils/prompt-errors";
 import { collectKeyLocations, promptForKey } from "../utils/variable-locations";
 import { refreshLocalDecryptedFiles } from "./add";
+import { INFRA_APP_NAME } from "./sync-ssm";
 import {
   applyPlans,
   loadEnvironments,
   planTargets,
+  variableAudience,
   writeChanges,
 } from "./update";
 import type { EnvironmentPlan, LoadedEnvironment } from "./update";
@@ -130,6 +132,15 @@ export const removeVariableLines = ({
   return { content: keep.join("\n"), removed };
 };
 
+/** What one environment's file changes took away. */
+interface RemovalOutcome {
+  /** Folder names that no longer see the key. */
+  dropped: string[];
+  environment: Environment;
+  /** Nothing sees the key any more. */
+  isRetired: boolean;
+}
+
 /**
  * Plans taking `removed` targets out of the key's audience in one
  * environment. Narrowing leaves it where the remaining targets belong (their
@@ -147,10 +158,10 @@ export const planRemoval = async ({
   loaded: LoadedEnvironment;
   /** Folder names of the targets losing the key. */
   removed: Set<string>;
-}): Promise<(EnvironmentPlan & { isRetired: boolean }) | null> => {
-  const isAffected = [...loaded.audience].some((name) => removed.has(name));
+}): Promise<(EnvironmentPlan & RemovalOutcome) | null> => {
+  const dropped = [...loaded.audience].filter((name) => removed.has(name));
 
-  if (!isAffected) {
+  if (dropped.length === 0) {
     return null;
   }
 
@@ -161,7 +172,7 @@ export const planRemoval = async ({
   if (targets.size > 0) {
     const plan = await planTargets({ allApps, key, loaded, targets });
 
-    return { ...plan, isRetired: false };
+    return { ...plan, dropped, isRetired: false };
   }
 
   const changes = Object.fromEntries(
@@ -172,6 +183,7 @@ export const planRemoval = async ({
   );
 
   return {
+    dropped,
     environment: loaded.environment,
     files: loaded.files,
     isRetired: true,
@@ -185,6 +197,8 @@ export const planRemoval = async ({
  * project until this runs.
  */
 interface VercelRemoval {
+  /** Projects to remove the key from; every Vercel app when omitted. */
+  apps?: AppConfig[];
   /** Report what would be removed from each project without deleting. */
   dryRun: boolean;
   /** Vercel environments (classic targets or custom) to remove the key from. */
@@ -225,14 +239,18 @@ const removeFromVercelApps = async (
       } else if (dryRun) {
         output.info(`  ${app.name}/${environment}: would remove ${key}`);
       } else {
-        await vercel.removeEnvironmentVariable(match.id);
-        output.success(`  ${app.name}/${environment}: removed ${key}`);
+        // Only this environment: the same variable can serve others the app still reads.
+        const outcome = await vercel.removeFromEnvironment(match, environment);
+        output.success(`  ${app.name}/${environment}: ${outcome} ${key}`);
       }
     });
   });
 };
 
-const removeFromVercel = async (removal: VercelRemoval): Promise<void> => {
+const removeFromVercel = async ({
+  apps,
+  ...removal
+}: VercelRemoval): Promise<void> => {
   if (isExternallyManagedKey(removal.key)) {
     output.info(
       `  Skipped ${removal.key}: managed outside this CLI (externallyManagedKeys in env.config.json)`
@@ -241,8 +259,10 @@ const removeFromVercel = async (removal: VercelRemoval): Promise<void> => {
     return;
   }
 
-  const apps = await AppDiscoveryService.getVercelApps();
-  await removeFromVercelApps(apps, removal);
+  await removeFromVercelApps(
+    apps ?? (await AppDiscoveryService.getVercelApps()),
+    removal
+  );
 };
 
 const removeFromSSM = async ({
@@ -277,13 +297,60 @@ const isSyncedToSSM = (key: string): boolean => {
   return [...required, ...optional].some((name) => name === key);
 };
 
+/**
+ * The remote copies to delete. A retired environment clears every Vercel app
+ * and SSM; a narrowed one only the apps that lost the key, which would
+ * otherwise keep reading it because `env sync` never deletes.
+ */
+export const planRemoteRemovals = ({
+  allApps,
+  key,
+  outcomes,
+}: {
+  allApps: AppConfig[];
+  key: string;
+  outcomes: RemovalOutcome[];
+}): {
+  /** Environments whose `/<environment>/<key>` parameter goes. */
+  ssmEnvironments: Environment[];
+  /** One `removeFromVercel` call each. */
+  vercel: Pick<VercelRemoval, "apps" | "environments">[];
+} => {
+  const retired = outcomes.flatMap(({ environment, isRetired }) =>
+    isRetired ? [environment] : []
+  );
+
+  const narrowed = outcomes.flatMap(({ dropped, environment, isRetired }) => {
+    const apps = allApps.filter(
+      (app) => app.type === "vercel" && dropped.includes(app.name)
+    );
+
+    return isRetired || apps.length === 0
+      ? []
+      : [{ apps, environments: [environment] }];
+  });
+
+  const ssmEnvironments = outcomes.flatMap(
+    ({ dropped, environment, isRetired }) =>
+      isRetired || dropped.includes(INFRA_APP_NAME) ? [environment] : []
+  );
+
+  return {
+    ssmEnvironments: isSyncedToSSM(key) ? ssmEnvironments : [],
+    vercel: [
+      ...(retired.length > 0 ? [{ environments: retired }] : []),
+      ...narrowed,
+    ],
+  };
+};
+
 /** Options of `env remove <KEY>`; passing a key makes the command non-interactive. */
 export interface RemoveFlags {
   /** Required for production, which is otherwise only reachable through the prompts. */
   confirmProduction?: boolean;
   /** Each `--env`, possibly comma-separated. */
   env?: string[];
-  /** Delete from Vercel and SSM for real once no copy is left; skipped otherwise. */
+  /** Delete from Vercel and SSM for real for every app that lost the key; skipped otherwise. */
   push?: boolean;
   /** Remove only this folder's copy (`shared` or an app); every copy when omitted. */
   target?: string;
@@ -299,6 +366,38 @@ export interface RemoveByFlagsDependencies {
   removeFromVercel: typeof removeFromVercel;
   writeChanges: typeof writeChanges;
 }
+
+const removeRemotely = async ({
+  dependencies,
+  dryRun,
+  key,
+  removals: { ssmEnvironments, vercel },
+}: {
+  dependencies: Pick<
+    RemoveByFlagsDependencies,
+    "removeFromSSM" | "removeFromVercel"
+  >;
+  dryRun: boolean;
+  key: string;
+  removals: ReturnType<typeof planRemoteRemovals>;
+}): Promise<void> => {
+  if (vercel.length > 0) {
+    output.section("Vercel");
+    // sequential: the Vercel client is stateful per project
+    await mapSequentially(vercel, (removal) =>
+      dependencies.removeFromVercel({ ...removal, dryRun, key })
+    );
+  }
+
+  if (ssmEnvironments.length > 0) {
+    output.section("SSM");
+    await dependencies.removeFromSSM({
+      dryRun,
+      environments: ssmEnvironments,
+      key,
+    });
+  }
+};
 
 const defaultRemoveByFlagsDependencies: RemoveByFlagsDependencies = {
   authenticate: authenticateForSops,
@@ -334,41 +433,59 @@ export const removeByFlags = async ({
 
   selectLocations({ environments, key, locations, target: flags.target });
 
+  const allApps = await dependencies.getAllApps();
+
   const loaded = await dependencies.loadEnvironments({
-    allApps: await dependencies.getAllApps(),
+    allApps,
     key,
     locations,
   });
 
-  const retired: Environment[] = [];
-
   // sequential so console output stays readable and ordered
-  await mapSequentially(loaded, async ({ environment, files }) => {
-    const directories = flags.target ? [flags.target] : [...files.keys()];
+  const outcomes = await mapSequentially(
+    loaded,
+    async ({ audience, environment, files }): Promise<RemovalOutcome> => {
+      const directories = flags.target ? [flags.target] : [...files.keys()];
 
-    const changes = Object.fromEntries(
-      directories.map((directory) => [
-        directory,
-        removeVariableLines({
-          content: files.get(directory)?.content ?? "",
-          key,
-        }).content,
-      ])
-    );
+      const changes = Object.fromEntries(
+        directories.map((directory) => [
+          directory,
+          removeVariableLines({
+            content: files.get(directory)?.content ?? "",
+            key,
+          }).content,
+        ])
+      );
 
-    await dependencies.writeChanges({ changes, environment, files });
+      await dependencies.writeChanges({ changes, environment, files });
 
-    if (directories.length === files.size) {
-      retired.push(environment);
+      const remaining = variableAudience({
+        allApps,
+        contents: Object.fromEntries(
+          [...files].map(([directory, { content }]) => [
+            directory,
+            changes[directory] ?? content,
+          ])
+        ),
+        key,
+      });
+
+      return {
+        dropped: [...audience].filter((name) => !remaining.has(name)),
+        environment,
+        isRetired: directories.length === files.size,
+      };
     }
-  });
+  );
 
   await dependencies.refreshLocalDecryptedFiles(environments);
   output.success(`${key} removed from the encrypted files.`);
 
-  if (retired.length === 0) {
+  const removals = planRemoteRemovals({ allApps, key, outcomes });
+
+  if (removals.vercel.length === 0 && removals.ssmEnvironments.length === 0) {
     output.info(
-      `${key} is still defined in another folder in ${environments.join(", ")}, so its Vercel and SSM values stay.`
+      `${key} is still defined for the same apps in ${environments.join(", ")}, so its Vercel and SSM values stay.`
     );
 
     return;
@@ -376,27 +493,13 @@ export const removeByFlags = async ({
 
   if (!flags.push) {
     output.info(
-      `Not deleted remotely. Re-run with --push to delete ${key} from Vercel and SSM in ${retired.join(", ")}.`
+      `Not deleted remotely. Re-run with --push to delete ${key} from Vercel and SSM where no app reads it any more.`
     );
 
     return;
   }
 
-  output.section("Vercel");
-  await dependencies.removeFromVercel({
-    dryRun: false,
-    environments: retired,
-    key,
-  });
-
-  if (isSyncedToSSM(key)) {
-    output.section("SSM");
-    await dependencies.removeFromSSM({
-      dryRun: false,
-      environments: retired,
-      key,
-    });
-  }
+  await removeRemotely({ dependencies, dryRun: false, key, removals });
 };
 
 export const removeCommand = new Command("remove")
@@ -413,7 +516,10 @@ export const removeCommand = new Command("remove")
     "--target <folder>",
     "remove only this folder's copy (shared or an app); every copy when omitted"
   )
-  .option("--push", "also delete from Vercel and SSM where no copy is left")
+  .option(
+    "--push",
+    "also delete from Vercel and SSM for every app that no longer sees it"
+  )
   .option("--confirm-production", "allow writing production without a prompt")
   .action(async (keyArgument: string | undefined, flags: RemoveFlags) => {
     try {
@@ -516,13 +622,14 @@ export const removeCommand = new Command("remove")
       output.log("");
       output.success(`${key} removed from the encrypted files.`);
 
-      const retired = plans.flatMap((plan) =>
-        plan.isRetired ? [plan.environment] : []
-      );
+      const removals = planRemoteRemovals({ allApps, key, outcomes: plans });
 
-      if (retired.length === 0) {
+      if (
+        removals.vercel.length === 0 &&
+        removals.ssmEnvironments.length === 0
+      ) {
         output.info(
-          `${key} is still seen by other apps in ${touched.join(", ")}, so its Vercel and SSM values stay.`
+          `None of the removed apps reads ${key} from Vercel or SSM in ${touched.join(", ")}, so nothing is deleted remotely.`
         );
         process.exit(0);
       }
@@ -532,28 +639,31 @@ export const removeCommand = new Command("remove")
         message: "Dry run the remote cleanup first?",
       });
 
-      if (
-        await confirm({
+      const isVercelConfirmed =
+        removals.vercel.length > 0 &&
+        (await confirm({
           default: false,
           message: "Also delete it from Vercel?",
-        })
-      ) {
-        output.section("Vercel");
-        await removeFromVercel({ dryRun, environments: retired, key });
-      }
+        }));
 
-      // Only keys the sync knows about ever reached SSM, so offering the rest
-      // would just print "not present" once per environment.
-      if (
-        isSyncedToSSM(key) &&
+      // Only keys the sync knows about ever reached SSM (planRemoteRemovals
+      // leaves the rest out), so offering them would just print "not present".
+      const isSSMConfirmed =
+        removals.ssmEnvironments.length > 0 &&
         (await confirm({
           default: false,
           message: "Also delete it from AWS SSM?",
-        }))
-      ) {
-        output.section("SSM");
-        await removeFromSSM({ dryRun, environments: retired, key });
-      }
+        }));
+
+      await removeRemotely({
+        dependencies: { removeFromSSM, removeFromVercel },
+        dryRun,
+        key,
+        removals: {
+          ssmEnvironments: isSSMConfirmed ? removals.ssmEnvironments : [],
+          vercel: isVercelConfirmed ? removals.vercel : [],
+        },
+      });
 
       if (dryRun) {
         output.info(

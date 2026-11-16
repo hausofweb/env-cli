@@ -21,7 +21,10 @@ import { SopsService } from "../services/sops.service";
 import { SSMService } from "../services/ssm.service";
 import type { SSMParameterType } from "../services/ssm.service";
 import type { Environment } from "../types/app-config.types";
-import { clearAWSCredentialEnvVars } from "../utils/aws-credential-env";
+import {
+  clearAWSCredentialEnvVars,
+  snapshotAWSEnvVars,
+} from "../utils/aws-credential-env";
 import { outputAWSCredentialsError } from "../utils/aws-credentials-guidance";
 import { output } from "../utils/cli-output";
 import {
@@ -83,7 +86,7 @@ const resolveEnvironments = (environmentArg: string): Environment[] => {
 
   if (!isSupportedEnvironment(environmentArg)) {
     throw new Error(
-      `Invalid environment: ${environmentArg}. Must be one of: production, preview, development, all`
+      `Invalid environment: ${environmentArg}. Must be one of: ${SUPPORTED_ENVIRONMENTS.join(", ")}, all`
     );
   }
 
@@ -576,6 +579,10 @@ export const handleSyncSSMCommand = async (
     output.warning("DRY RUN MODE - No changes will be made\n");
   }
 
+  // Each environment assumes its own profile; whatever runs next in this
+  // process gets the caller's profile and credentials back, even on failure.
+  const restoreAWSEnvVars = snapshotAWSEnvVars();
+
   // must stay sequential — authenticateForEnvironment mutates process.env.AWS_PROFILE, a shared global that later calls in this iteration depend on
   const failures = await mapSequentially(environments, async (environment) => {
     try {
@@ -599,6 +606,9 @@ export const handleSyncSSMCommand = async (
 
       return 1;
     }
+  }).finally(() => {
+    restoreAWSEnvVars();
+    syncSSMCommandDependencies.resetSSMClient();
   });
 
   const totalFailed = failures.reduce((sum, failed) => sum + failed, 0);

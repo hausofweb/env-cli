@@ -8,9 +8,11 @@ import { isExitPromptError } from "./utils/prompt-errors";
 // instead of requiring the caller to remember command names and flags.
 const hasArguments = process.argv.length > 2;
 
-const runInteractive = async (): Promise<void> => {
+const run = async (): Promise<void> => {
   try {
-    await runInteractiveEnvMode({ hasMainMenu: false });
+    await (hasArguments
+      ? createEnvProgram().parseAsync(process.argv)
+      : runInteractiveEnvMode({ hasMainMenu: false }));
   } catch (error) {
     if (isExitPromptError(error)) {
       console.log("\nCancelled.");
@@ -19,15 +21,9 @@ const runInteractive = async (): Promise<void> => {
       return;
     }
 
-    console.error(
-      error instanceof Error ? error.message : "Interactive mode failed"
-    );
+    console.error(error instanceof Error ? error.message : "Command failed");
     process.exitCode = 1;
   }
 };
 
-if (hasArguments) {
-  createEnvProgram().parse(process.argv);
-} else {
-  runInteractive();
-}
+await run();

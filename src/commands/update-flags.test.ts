@@ -141,6 +141,8 @@ describe(updateByFlags, () => {
     [{ env: ["stagin"], value: "v" }, "Unknown environment stagin"],
     [{ env: ["staging"], to: "web", value: "v" }, "--to only applies"],
     [{ apps: true, env: ["staging"] }, "--apps needs --to"],
+    // An empty audience would move the key into a block no app reads.
+    [{ apps: true, env: ["staging"], to: " , " }, "--apps needs --to"],
     [
       { apps: true, env: ["staging"], to: "web", value: "v" },
       "--apps takes --to",

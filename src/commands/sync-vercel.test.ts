@@ -1,14 +1,24 @@
 import type { confirm as inquirerConfirm } from "@inquirer/prompts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { AppDiscoveryService } from "../services/app-discovery.service";
+import { SopsService } from "../services/sops.service";
+import { VercelService } from "../services/vercel.service";
 import type { VercelExistingVariable } from "../services/vercel.service";
 import type { Environment } from "../types/app-config.types";
 import { output } from "../utils/cli-output";
+import { FileOperations } from "../utils/file-operations";
 import {
   buildAppVariables,
   createPruneAppEnvironment,
   findPruneCandidates,
+  handleSyncCommand,
 } from "./sync-vercel";
+
+vi.mock(import("../lib/aws-credentials"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  checkAndAuthenticateAWS: vi.fn(() => Promise.resolve()),
+}));
 
 const confirm = vi.fn<typeof inquirerConfirm>();
 const pruneAppEnvironment = createPruneAppEnvironment({ confirm });
@@ -209,4 +219,48 @@ describe("pruneAppEnvironment", () => {
       "  web/production: would remove STALE_SHARED (narrowed; stays on 1 other environment(s))"
     );
   });
+});
+
+describe("handleSyncCommand on a failed decrypt", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(SopsService, "validateSopsInstalled").mockReturnValue(undefined);
+    vi.spyOn(FileOperations, "fileExists").mockResolvedValue(true);
+    vi.spyOn(AppDiscoveryService, "getVercelApps").mockResolvedValue([
+      { directory: "apps/web", name: "web", type: "vercel" },
+    ]);
+    vi.spyOn(VercelService, "resolveProject").mockResolvedValue({
+      orgId: "team_1",
+      projectId: "prj_web",
+    });
+    vi.spyOn(VercelService, "create").mockRejectedValue(
+      new Error("nothing may be pushed")
+    );
+
+    for (const method of [
+      "error",
+      "info",
+      "log",
+      "section",
+      "success",
+      "warning",
+    ] as const) {
+      vi.spyOn(output, method).mockReturnValue(undefined);
+    }
+  });
+
+  // A partial set would be pushed and the run would still exit 0.
+  it.each(["web", "shared"])(
+    "fails the sync and pushes nothing when the %s file fails to decrypt",
+    async (failing) => {
+      vi.spyOn(SopsService, "decrypt").mockImplementation((filePath) =>
+        filePath.includes(`/${failing}/`)
+          ? Promise.reject(new Error("AccessDeniedException"))
+          : Promise.resolve('KEY="value"\n')
+      );
+
+      await expect(handleSyncCommand("staging", {})).resolves.toBe(true);
+      expect(VercelService.create).not.toHaveBeenCalled();
+    }
+  );
 });

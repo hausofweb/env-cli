@@ -37,7 +37,7 @@ export const parseEnvContent = (content: string): EnvVariables => {
 
     if (match) {
       const [, key] = match;
-      result[key] = match[3] || match[4] || match[5];
+      result[key] = match[3] ?? match[4] ?? match[5] ?? "";
     }
   }
 

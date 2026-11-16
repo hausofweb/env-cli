@@ -1,6 +1,8 @@
 # @hausofweb/env-cli
 
-SOPS-encrypted env var management for Haus of Web monorepos. Variables live encrypted in git under `env/`, and the `hwenv` CLI decrypts them into each app's `.env.local`, syncs them to Vercel and AWS SSM, and edits them without ever leaving plaintext behind.
+SOPS-encrypted env var management for Haus of Web monorepos. Variables live encrypted in git under `env/`, and the `hwenv` CLI decrypts them into each app's `.env.local`, syncs them to Vercel and AWS SSM, and edits them in place.
+
+Plaintext does land on disk: `decrypt` writes `env/<app>/.env.<environment>`, `env/shared/.env.<environment>` and each app's `.env.local` (`setup` writes the same for one app, without the shared file), and `encrypt` leaves the plaintext files it encrypted in place. Ignore them in your repository's `.gitignore` (for example `env/**/.env.*` with `!env/**/*.enc`, plus `.env.local`), and run `delete-local` when you no longer need the `.env.local` files.
 
 ## Install
 
@@ -100,7 +102,7 @@ EXTERNAL_REPOSITORY=owner/repo
 
 ## Commands
 
-- `decrypt [environment]` decrypts the encrypted files and writes each app's `.env.local` (`--all` includes non-Vercel apps).
+- `decrypt [environment]` decrypts the encrypted files for every app, Vercel or not, and writes each app's `.env.local` (`--no-copy` skips the `.env.local` files; `--all` is accepted but does nothing).
 - `encrypt` encrypts every plaintext env file with SOPS.
 - `add [key]` adds a variable through a wizard, or non-interactively when a key and flags are given.
 - `update [key]` changes a variable's value in place, or with `--apps` which apps see it.
@@ -113,11 +115,11 @@ EXTERNAL_REPOSITORY=owner/repo
 - `list` lists the discovered apps and their types.
 - `delete-local` deletes every app's `.env.local`.
 
-Commands that change production require `--confirm-production` when run non-interactively. Run `hwenv <command> --help` for every flag.
+`add`, `update` and `remove` require `--confirm-production` when given a KEY and production is among the environments. `sync` and `sync-ssm` take no such flag: they push what the encrypted files already hold, so `hwenv sync-ssm production` (and `all`, the default) writes production parameters with the `awsProfiles.production` profile without asking. Run `hwenv <command> --help` for every flag.
 
 ## Adding your own commands
 
-The package exports the program builder, so a repository can register extra commander commands on it.
+The package exports the program builder, so a repository can register extra commander commands on it. Add `commander` as a direct dependency first, since pnpm does not expose the CLI's own copy to your code: `pnpm add -D commander`.
 
 ```ts
 import { createEnvProgram } from "@hausofweb/env-cli";
@@ -127,7 +129,7 @@ const rotateKeys = new Command("rotate-keys").action(() => {
   // ...
 });
 
-createEnvProgram({ commands: [rotateKeys] }).parse(process.argv);
+await createEnvProgram({ commands: [rotateKeys] }).parseAsync(process.argv);
 ```
 
 ## Development

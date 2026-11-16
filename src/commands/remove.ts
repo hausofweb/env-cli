@@ -1,7 +1,11 @@
 import { checkbox, confirm } from "@inquirer/prompts";
 import { Command } from "commander";
 
-import { getSsmKeys, isExternallyManagedKey } from "../config";
+import {
+  getSsmKeys,
+  getSsmParameterNames,
+  isExternallyManagedKey,
+} from "../config";
 import { ENVIRONMENTS } from "../constants/environments";
 import { mapSequentially } from "../lib/async";
 import {
@@ -270,16 +274,19 @@ const removeFromSSM = async ({
   environments,
   key,
 }: {
-  /** Report which `/<environment>/<key>` parameters exist without deleting them. */
+  /** Report which parameters exist without deleting them. */
   dryRun: boolean;
-  /** Each maps to the SSM namespace `/<environment>/`. */
+  /** Each maps to its SSM paths via `getSsmParameterNames`. */
   environments: Environment[];
   /** Variable being retired; a missing parameter is reported, not an error. */
   key: string;
 }): Promise<void> => {
+  const names = environments.flatMap((environment) =>
+    getSsmParameterNames({ environment, key })
+  );
+
   // sequential so console output stays readable and ordered
-  await mapSequentially(environments, async (environment) => {
-    const name = `/${environment}/${key}`;
+  await mapSequentially(names, async (name) => {
     const result = await SSMService.deleteParameter({ dryRun, name });
 
     if (result.action === "deleted") {
